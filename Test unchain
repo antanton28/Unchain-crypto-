@@ -1,0 +1,309 @@
+use blake3;
+use ed25519_dalek::{Keypair, Signer, Verifier, PublicKey, Signature};
+use serde::{Serialize, Deserialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use tokio::sync::RwLock;
+use tokio::time::{sleep, Duration};
+use redis::Client as RedisClient; // Add redis crate
+use rocksdb::{DB, Options};
+use rand::rngs::OsRng;
+use hex;
+use sha2::{Sha256, Digest};
+use tokio::net::UdpSocket; // For networking
+
+const SHARD_COUNT: usize = 1000;
+const MAX_TXS_PER_BLOCK: usize = 1000;
+const BLOCK_TIME_MS: u64 = 100; // 10 blocks/sec per shard
+const STAKE_MINIMUM: u64 = 1000; // Minimum GROK to stake
+const TX_FEE_PERCENT: f64 = 0.01;
+const BLOCK_REWARD: u64 = 10;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Transaction {
+    sender: String, // Hex-encoded public key
+    receiver: String,
+    amount: u64,
+    id: u64,
+    signature: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Block {
+    shard_id: usize,
+    prev_hash: String,
+    transactions: Vec<Transaction>,
+    timestamp: u64,
+    hash: String,
+    poh_index: usize,
+    validator: String, // Validator's public key
+    fees: u64,
+}
+
+#[derive(Clone)]
+struct Validator {
+    public_key: String,
+    stake: u64,
+    score: i32, // Peer score for reliability
+}
+
+struct GrokChainSim {
+    shard_id: usize,
+    db: Arc<DB>,
+    redis: Arc<RedisClient>,
+    balances: Arc<RwLock<HashMap<String, u64>>>,
+    grok_balances: Arc<RwLock<HashMap<String, u64>>>,
+    pending_transactions: Arc<RwLock<Vec<Transaction>>>,
+    poh_chain: Arc<RwLock<Vec<String>>>,
+    validators: Arc<RwLock<Vec<Validator>>>,
+    keypair: Keypair,
+    peers: Vec<String>,
+}
+
+impl GrokChainSim {
+    async fn new(shard_id: usize, peers: Vec<String>) -> Self {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = Arc::new(DB::open(&opts, format!("grokchain_db_shard_{}", shard_id)).unwrap()));
+        let redis = Arc::new(RedisClient::open("redis://127.0.0.1/").unwrap());
+        let poh_chain = vec![format!("{:x}", Sha256::digest(b"GrokChain PoH Seed"))];
+        let genesis = Block {
+            shard_id,
+            prev_hash: "0".to_string(),
+            transactions: vec![],
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            hash: "00genesis".to_string(),
+            poh_index: 0,
+            validator: hex::encode(Keypair::generate(&mut OsRng).public.as_bytes()),
+            fees: 0,
+        };
+        db.put(b"block_0", &bincode::serialize(&genesis).unwrap()).unwrap();
+
+        let mut validators = Vec::new();
+        let keypair = Keypair::generate(&mut OsRng);
+        validators.push(Validator {
+            public_key: hex::encode(keypair.public.as_bytes()),
+            stake: STAKE_MINIMUM,
+            score: 100,
+        });
+
+        GrokChainSim {
+            shard_id,
+            db,
+            redis,
+            balances: Arc::new(RwLock::new(HashMap::new())),
+            grok_balances: Arc::new(RwLock::new(HashMap::new())),
+            pending_transactions: Arc::new(RwLock::new(Vec::new())),
+            poh_chain: Arc::new(RwLock::new(poh_chain)),
+            validators: Arc::new(RwLock::new(validators)),
+            keypair,
+            peers,
+        }
+    }
+
+    async fn verify_transaction(&self, tx: &Transaction) -> bool {
+        let message = format!("{}{}{}{}", tx.sender, tx.receiver, tx.amount, tx.id).into_bytes();
+        if let Ok(pk_bytes) = hex::decode(&tx.sender) {
+            if let Ok(public_key) = PublicKey::from_bytes(&pk_bytes) {
+                if let Ok(sig) = Signature::from_bytes(&tx.signature) {
+                    return public_key.verify(&message, &sig).is_ok();
+                }
+            }
+        }
+        false
+    }
+
+    async fn add_transaction(&self, tx: Transaction) -> Result<(), &'static str> {
+        if !self.verify_transaction(&tx).await {
+            return Err("Invalid signature");
+        }
+        let fee = (tx.amount as f64 * TX_FEE_PERCENT).round() as u64;
+        let mut balances = self.balances.write().await;
+        let sender_balance = balances.entry(tx.sender.clone()).or_insert(0);
+        if *sender_balance < tx.amount + fee {
+            return Err("Insufficient balance");
+        }
+        let mut pending = self.pending_transactions.write().await;
+        pending.push(tx);
+        Ok(())
+    }
+
+    async fn select_validator(&self) -> String {
+        let validators = self.validators.read().await;
+        // Simple weighted random selection based on stake
+        let total_stake: u64 = validators.iter().map(|v| v.stake).sum();
+        let mut rng = rand::thread_rng();
+        let pick = (rng.gen::<f64>() * total_stake as f64) as u64;
+        let mut cumulative = 0;
+        for validator in validators.iter() {
+            cumulative += validator.stake;
+            if cumulative >= pick {
+                return validator.public_key.clone();
+            }
+        }
+        validators[0].public_key.clone() // Fallback
+    }
+
+    async fn mine_block(&self) -> Option<Block> {
+        let mut pending = self.pending_transactions.write().await;
+        let txs = pending.drain(0..MAX_TXS_PER_BLOCK.min(pending.len())).collect::<Vec<_>>();
+        drop(pending);
+
+        let mut valid_txs = Vec::new();
+        let mut fees = 0;
+        {
+            let mut balances = self.balances.write().await;
+            for tx in txs {
+                if self.verify_transaction(&tx).await {
+                    let fee = (tx.amount as f64 * TX_FEE_PERCENT).round() as u64;
+                    fees += fee;
+                    let sender_balance = balances.entry(tx.sender.clone()).or_insert(0);
+                    if *sender_balance >= tx.amount + fee {
+                        *sender_balance -= tx.amount + fee;
+                        *balances.entry(tx.receiver.clone()).or_insert(0) += tx.amount;
+                        valid_txs.push(tx);
+                    }
+                }
+            }
+        }
+
+        if valid_txs.is_empty() {
+            return None;
+        }
+
+        let block_count = self.get_block_count().await;
+        let prev_key = format!("block_{}", block_count - 1);
+        let prev_data = self.db.get(prev_key.as_bytes()).unwrap().unwrap();
+        let prev_block: Block = bincode::deserialize(&prev_data).unwrap();
+
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let validator = self.select_validator().await;
+        let block_content = format!("{}{:?}{}{}", prev_block.hash, valid_txs, timestamp, validator);
+        let hash = format!("{:x}", blake3::hash(block_content.as_bytes()));
+
+        let mut poh_chain = self.poh_chain.write().await;
+        let new_poh = format!("{:x}", Sha256::digest(hash.as_bytes()));
+        let poh_index = poh_chain.len();
+        poh_chain.push(new_poh);
+
+        let block = Block {
+            shard_id: self.shard_id,
+            prev_hash: prev_block.hash,
+            transactions: valid_txs,
+            timestamp,
+            hash,
+            poh_index,
+            validator: validator.clone(),
+            fees,
+        };
+
+        let mut grok_balances = self.grok_balances.write().await;
+        *grok_balances.entry(validator).or_insert(0) += BLOCK_REWARD + fees;
+
+        let key = format!("block_{}", block_count);
+        self.db.put(key.as_bytes(), &bincode::serialize(&block).unwrap()).unwrap();
+        let mut redis_conn = self.redis.get_async_connection().await.unwrap();
+        redis::cmd("SET").arg(&key).arg(&bincode::serialize(&block).unwrap()).query_async(&mut redis_conn).await.unwrap();
+
+        self.broadcast_block(&block).await;
+        Some(block)
+    }
+
+    async fn get_block_count(&self) -> usize {
+        let mut count = 0;
+        while self.db.get(format!("block_{}", count).as_bytes()).unwrap().is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    async fn broadcast_block(&self, block: &Block) {
+        let block_bytes = bincode::serialize(block).unwrap();
+        for peer in &self.peers {
+            let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            socket.send_to(&block_bytes, peer).await.unwrap();
+        }
+    }
+
+    async fn handle_incoming_blocks(&self, socket: Arc<UdpSocket>) {
+        let mut buf = [0; 65535];
+        while let Ok((size, _)) = socket.recv_from(&mut buf).await {
+            if let Ok(block) = bincode::deserialize::<Block>(&buf[..size]) {
+                if block.shard_id == self.shard_id {
+                    // Simplified BFT: accept if from a known validator
+                    let validators = self.validators.read().await;
+                    if validators.iter().any(|v| v.public_key == block.validator) {
+                        let key = format!("block_{}", self.get_block_count().await);
+                        self.db.put(key.as_bytes(), &bincode::serialize(&block).unwrap()).unwrap();
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let peers = vec!["127.0.0.1:9001".to_string(), "127.0.0.1:9002".to_string()];
+    let mut handles = Vec::new();
+
+    // Simulate 1,000 shards
+    for shard_id in 0..SHARD_COUNT {
+        let chain = Arc::new(GrokChainSim::new(shard_id, peers.clone()).await);
+        let chain_clone = chain.clone();
+
+        // Initialize balances
+        {
+            let mut balances = chain.balances.write().await;
+            let pubkey = hex::encode(chain.keypair.public.as_bytes());
+            balances.insert(pubkey.clone(), 1_000_000); // Enough for testing
+            balances.insert(format!("receiver_{}", shard_id), 0);
+        }
+
+        // Transaction generator
+        let chain_tx = chain.clone();
+        handles.push(tokio::spawn(async move {
+            let mut tx_id = 0;
+            loop {
+                let sender = hex::encode(chain_tx.keypair.public.as_bytes());
+                let receiver = format!("receiver_{}", shard_id);
+                let message = format!("{}{}{}", sender, receiver, tx_id).into_bytes();
+                let signature = chain_tx.keypair.sign(&message).to_bytes().to_vec();
+                let tx = Transaction {
+                    sender,
+                    receiver,
+                    amount: 100,
+                    id: tx_id,
+                    signature,
+                };
+                chain_tx.add_transaction(tx).await.unwrap();
+                tx_id += 1;
+                sleep(Duration::from_micros(100)).await; // ~10,000 TPS per shard
+            }
+        }));
+
+        // Block producer
+        handles.push(tokio::spawn(async move {
+            let socket = Arc::new(UdpSocket::bind(format!("0.0.0.0:{}", 9000 + shard_id)).await.unwrap());
+            let chain_net = chain_clone.clone();
+            tokio::spawn(async move { chain_net.handle_incoming_blocks(socket).await });
+
+            let mut block_count = 0;
+            let start = SystemTime::now();
+            loop {
+                if let Some(block) = chain_clone.mine_block().await {
+                    block_count += 1;
+                    if block_count % 100 == 0 {
+                        let elapsed = start.elapsed().unwrap().as_secs_f64();
+                        let tps = (block_count * MAX_TXS_PER_BLOCK) as f64 / elapsed;
+                        println!("Shard {}: {} blocks, TPS: {:.2}", shard_id, block_count, tps);
+                    }
+                }
+                sleep(Duration::from_millis(BLOCK_TIME_MS)).await;
+            }
+        }));
+    }
+
+    futures::future::join_all(handles).await;
+}
